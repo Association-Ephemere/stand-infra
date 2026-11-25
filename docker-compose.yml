@@ -31,6 +31,10 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672"
+    networks:
+      default:
+        aliases:
+          - rabbitmq.stand.local
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
@@ -40,20 +44,26 @@ services:
 
   minio:
     profiles: [primary]
-    image: minio/minio
+    image: rustfs/rustfs
     container_name: minio
-    command: server /data --console-address ":9001"
+    command: /data
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-      MINIO_SERVER_URL: "http://${PRIMARY_IP:-127.0.0.1}:9000"
+      RUSTFS_ACCESS_KEY: minioadmin
+      RUSTFS_SECRET_KEY: minioadmin
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
     volumes:
       - minio_data:/data
     ports:
       - "9000:9000"
       - "9001:9001"
+    networks:
+      default:
+        aliases:
+          - minio.stand.local
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -61,15 +71,20 @@ services:
 
   minio-init:
     profiles: [primary]
-    image: minio/mc
+    image: rclone/rclone:latest
     container_name: minio-init
     depends_on:
       minio:
         condition: service_healthy
+    environment:
+      RCLONE_CONFIG_LOCAL_TYPE: s3
+      RCLONE_CONFIG_LOCAL_PROVIDER: Other
+      RCLONE_CONFIG_LOCAL_ENDPOINT: http://minio:9000
+      RCLONE_CONFIG_LOCAL_ACCESS_KEY_ID: minioadmin
+      RCLONE_CONFIG_LOCAL_SECRET_ACCESS_KEY: minioadmin
     entrypoint: >
       /bin/sh -c "
-      mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb --ignore-existing local/photostand &&
+      rclone mkdir local:photostand &&
       echo 'Bucket photostand ready'
       "
     restart: "no"
@@ -110,13 +125,14 @@ services:
 
   job-svc:
     profiles: [primary]
-    build: ../job-svc
+    build: ../stand-job-svc
     container_name: job-svc
     environment:
       ASPNETCORE_ENVIRONMENT: Production
       ConnectionStrings__Postgres: "Host=postgres;Port=5432;Database=photostand;Username=root;Password=root"
       RabbitMq__Uri: "amqp://guest:guest@rabbitmq:5672"
-      MinIO__Endpoint: "${PRIMARY_IP:-127.0.0.1}:9000"
+      MinIO__Endpoint: "minio:9000"
+      MinIO__PublicEndpoint: "${PRIMARY_IP:-127.0.0.1}:9000"
       MinIO__AccessKey: minioadmin
       MinIO__SecretKey: minioadmin
       MinIO__UseSSL: "false"
@@ -131,6 +147,8 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/8080' 2>/dev/null"]
       interval: 10s
@@ -140,12 +158,12 @@ services:
 
   ingest-svc:
     profiles: [primary, secondary]
-    build: ../ingest-svc
+    build: ../stand-ingest-svc
     container_name: ingest-svc
-    user: "0"
+    user: "${PUID:-1000}:${PGID:-1000}"
     environment:
       DOTNET_ENVIRONMENT: Production
-      Watcher__Path: /data/input
+      Watcher__Path: /data/watch
       Watcher__StandId: ${STAND_ID:-stand-a}
       Watcher__ProcessedPath: /data/processed
       Watcher__FailedPath: /data/failed
@@ -162,9 +180,7 @@ services:
       Watermark__PaddingY: 100
       Watermark__HeightPx: 300
     volumes:
-      - ./volumes/capture/${STAND_ID:-stand-a}/watch:/data/input
-      - ./volumes/capture/${STAND_ID:-stand-a}/processed:/data/processed
-      - ./volumes/capture/${STAND_ID:-stand-a}/failed:/data/failed
+      - ./volumes/capture/${STAND_ID:-stand-a}:/data
       - ./watermark:/watermarks:ro
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1"]
@@ -175,7 +191,7 @@ services:
 
   frontend:
     profiles: [primary]
-    build: ../frontend
+    build: ../stand-frontend
     container_name: frontend
     environment:
       VITE_JOB_SERVICE_URL: "http://${PRIMARY_IP:-127.0.0.1}:8080"
@@ -188,7 +204,64 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Linux host only: builds Windows PrintSvc.exe and runs it inside a Windows VM
+  # with USB passthrough for proprietary printer drivers (e.g. Fujifilm DX100).
+  # Enable via COMPOSE_PROFILES=primary,print-vm (or --profile print-vm).
+  # On a native Windows host, leave print-vm disabled and run stand-print-svc directly.
+  print-svc-builder:
+    profiles: [print-vm]
+    build:
+      context: ../stand-print-svc
+      dockerfile: Dockerfile.win-publish
+      network: host
+    container_name: print-svc-builder
+    environment:
+      PRINT_BROKER_HOST: "${PRINT_BROKER_HOST:-rabbitmq.stand.local}"
+      PRINT_BROKER_PORT: "${PRINT_BROKER_PORT:-5672}"
+      PRINT_STORAGE_ENDPOINT: "${PRINT_STORAGE_ENDPOINT:-minio.stand.local:9000}"
+      PRINT_STORAGE_BUCKET: "photostand"
+      PRINTER_NAME: "${PRINTER_NAME:-}"
+      PAPER_WIDTH_INCHES: "${PAPER_WIDTH_INCHES:-6.0}"
+      PAPER_HEIGHT_INCHES: "${PAPER_HEIGHT_INCHES:-4.0}"
+    volumes:
+      - print_svc_dist:/out
+    restart: "no"
+
+  print-vm:
+    profiles: [print-vm]
+    image: dockurr/windows
+    container_name: print-vm
+    depends_on:
+      print-svc-builder:
+        condition: service_completed_successfully
+    environment:
+      VERSION: "${PRINT_VM_WINDOWS_VERSION:-10}"
+      RAM_SIZE: "${PRINT_VM_RAM:-4G}"
+      CPU_CORES: "${PRINT_VM_CPUS:-2}"
+      DISK_SIZE: "${PRINT_VM_DISK:-40G}"
+      LANGUAGE: "French"
+      ARGUMENTS: "${PRINTER_USB_ARGS:--device usb-host,vendorid=0x04cb,productid=0x5007}"
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+      - /dev/bus/usb
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "8006:8006"
+      - "3389:3389/tcp"
+      - "3389:3389/udp"
+    volumes:
+      - print_vm_storage:/storage
+      - print_svc_dist:/data/print-svc:ro
+      - ./print-vm/oem:/oem:ro
+      - ./print-vm/drivers:/data/drivers:ro
+    stop_grace_period: 2m
+    restart: unless-stopped
+
 volumes:
   rabbitmq_data:
   minio_data:
   pgadmin_data:
+  print_svc_dist:
+  print_vm_storage:
